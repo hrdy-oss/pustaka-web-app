@@ -8,7 +8,7 @@ Dokumen ini juga berfungsi sebagai **kunci pengerjaan** untuk juri/pembuat soal.
 - Katalog buku dengan pencarian dan halaman, cover diambil dari S3 (folder `covers/`)
 - Daftar, masuk, keluar; meminjam dan mengembalikan buku
 - Halaman admin: tambah, ubah, hapus buku, dan lihat peminjaman terakhir
-- `/health.php` untuk health check ALB (`/health.php?deep=1` juga mengecek database)
+- `/health.php` untuk health check ALB; mengecek koneksi RDS dan tabel aplikasi
 - Footer menampilkan **instance-id dan AZ** server yang melayani, jadi load balancing terlihat saat refresh
 - Session PHP disimpan di **tabel MySQL**, jadi login tidak hilang saat request pindah antar-EC2
 
@@ -25,13 +25,13 @@ deploy/        userdata.sh, pustaka.conf (Apache), s3-bucket-policy.json
 .env.example   contoh konfigurasi (file .env asli jangan di-commit)
 ```
 
-> Aplikasi ditulis untuk PHP 8.1 (bawaan Ubuntu 22.04). Kode belum dijalankan di lingkungan AWS
-> oleh pembuatnya, jadi lakukan uji coba penuh sebelum dipakai untuk lomba.
+> Aplikasi ditulis untuk PHP 8.1 (bawaan Ubuntu 22.04). Setelah deploy, pastikan target group ALB
+> menandai EC2 sehat sebelum membuka DNS ALB.
 
 ## 0. Persiapan
 
-1. Push folder ini ke repo GitHub **publik** (misalnya `pustaka-digital`). File `.env` sudah ada di `.gitignore`.
-2. Siapkan: key pair (`lks-key`), nama bucket unik (`lks-pustaka-<nama>`), dan password database tanpa spasi atau tanda kutip.
+1. Repo saat ini: `https://github.com/hrdy-oss/pustaka-web-app.git`. Push perubahan terbaru ke repo ini sebelum membuat EC2 dari Launch Template. File `.env` sudah ada di `.gitignore`.
+2. Siapkan: key pair (`lks-key`), nama bucket unik (`lks-pustaka-<nama>`), dan password database.
 3. Region **ap-southeast-1**. Semua resource berawalan `lks-`, tag `Project = pustaka-digital`.
 
 ## 1. Networking (VPC)
@@ -109,17 +109,44 @@ Jalankan satu EC2 di `lks-app-a` dengan User Data dari langkah 7. Dari bastion:
 `ssh -i lks-key.pem ubuntu@<IP-PRIVATE>`, lalu `curl -s localhost/health.php` (harus `OK`)
 dan `sudo tail -n 30 /var/log/user-data.log` jika ada masalah.
 
+### Deploy manual ke EC2 yang sudah ada
+
+Jika Apache/PHP sudah terpasang dan schema RDS sudah diimpor, jalankan aplikasi di path tetap
+`/var/www/pustaka`. Bagian pentingnya adalah mengaktifkan VirtualHost proyek supaya root DNS ALB
+menyajikan `public/index.php`.
+
+```bash
+sudo git clone https://github.com/hrdy-oss/pustaka-web-app.git /var/www/pustaka
+sudo install -o root -g www-data -m 640 /var/www/pustaka/.env.example /var/www/pustaka/.env
+sudo nano /var/www/pustaka/.env
+sudo chown -R root:www-data /var/www/pustaka
+sudo find /var/www/pustaka -type d -exec chmod 750 {} +
+sudo find /var/www/pustaka -type f -exec chmod 640 {} +
+sudo cp /var/www/pustaka/deploy/pustaka.conf /etc/apache2/sites-available/pustaka.conf
+sudo a2dissite 000-default
+sudo a2ensite pustaka
+sudo apache2ctl configtest
+sudo systemctl reload apache2
+```
+
+Isi `.env` dengan endpoint RDS, nama database `pustaka`, user, dan password. `S3_BASE_URL` boleh
+kosong. Pastikan file `.env` tetap `root:www-data` dengan mode `640`, lalu uji
+`curl -i http://localhost/health.php`. Jangan arahkan DocumentRoot ke folder repo utama.
+
 ## 7. Launch Template
 
 1. `lks-lt`: AMI Ubuntu Server 22.04 LTS, instance type `t3.small`, key pair `lks-key`.
 2. Network: **jangan** set subnet; SG `lks-sg-app`.
-3. Advanced details, User Data: isi dengan `deploy/userdata.sh` yang bagian KONFIGURASI-nya sudah diubah
-   (`REPO_URL`, `DB_HOST`, `DB_PASS`, `S3_BASE_URL`).
+3. Advanced details, User Data: isi dengan `deploy/userdata.sh`. Ubah `DB_HOST`, `DB_USER`, dan
+   `DB_PASS` pada bagian KONFIGURASI. Repo sudah mengarah ke repo proyek ini. `S3_BASE_URL` boleh
+   dikosongkan jika cover belum disimpan di S3.
+4. Pastikan schema dari `database/pustaka.sql` sudah diimpor ke RDS sebelum aplikasi digunakan.
+   User Data tidak mengimpor atau menghapus isi database.
 
 ## 8. Target Group dan ALB
 
 1. Target group `lks-tg`: tipe Instances, HTTP 80, VPC `lks-vpc`, health check path `/health.php`,
-   healthy threshold 2, interval 15 detik. Jangan daftarkan target manual.
+   success code `200`, healthy threshold 2, interval 15 detik. Jangan daftarkan target manual.
 2. ALB `lks-alb`: Internet-facing, subnet `lks-public-a` dan `lks-public-b`, SG `lks-sg-alb`,
    listener HTTP 80 ke `lks-tg`.
 
@@ -130,7 +157,21 @@ dan `sudo tail -n 30 /var/log/user-data.log` jika ada masalah.
    health check grace period **300 detik** (instalasi User Data butuh 2 sampai 4 menit).
 3. Min 2, desired 2, max 4.
 4. Scaling policy: Target tracking, metric Average CPU utilization, target **50**.
-5. Tunggu 2 instance berstatus *healthy* di `lks-tg`, lalu buka DNS ALB di browser.
+5. Tunggu instance berstatus *healthy* di `lks-tg`, lalu buka `http://<DNS-ALB>/` di browser.
+   Apache diarahkan ke folder `public/`, jadi halaman katalog tampil di root DNS ALB dan isi folder
+   proyek tidak diekspos.
+
+### Jika DNS ALB menampilkan folder atau 504
+
+- **Folder/daftar file:** pastikan VirtualHost `pustaka.conf` aktif dan `DocumentRoot`-nya
+  `/var/www/pustaka/public`, bukan `/var/www/html` atau `/var/www/pustaka`.
+- **Target unhealthy atau ALB 504:** cek Target Group > Targets. Security Group EC2 harus menerima
+  TCP 80 dari Security Group ALB; Target Group harus meneruskan HTTP ke port 80.
+- Di EC2, cek `sudo systemctl status apache2`, `sudo apache2ctl configtest`,
+  `curl -i http://localhost/health.php`, dan `/var/log/apache2/pustaka-error.log`.
+- Health check mengembalikan `503` jika RDS tidak bisa dicapai atau tabel `books`, `users`, `loans`,
+  atau `sessions` belum ada. Cek endpoint/password `.env`, rule RDS 3306 dari Security Group EC2,
+  dan pastikan SQL sudah diimpor.
 
 ## 10. Monitoring (CloudWatch)
 
@@ -158,7 +199,7 @@ dan `sudo tail -n 30 /var/log/user-data.log` jika ada masalah.
 
 | Gejala | Penyebab dan solusi |
 |---|---|
-| Target `unhealthy` terus | User Data belum selesai atau gagal: lihat `/var/log/user-data.log`. Pastikan NAT Gateway aktif dan route `lks-rt-app` benar. |
+| Target `unhealthy` terus | User Data belum selesai atau gagal: lihat `/var/log/user-data.log`. Pastikan NAT Gateway aktif dan route `lks-rt-app` benar; health check juga memerlukan RDS dan tabel aplikasi. |
 | Halaman error 500 | `.env` salah (endpoint atau password DB) atau `lks-sg-db` belum mengizinkan `lks-sg-app`. Cek `/var/log/apache2/pustaka-error.log`. |
 | Cover tidak tampil | Bucket policy belum terpasang, Block Public Access masih aktif, atau `S3_BASE_URL` salah. |
 | Login selalu kembali ke halaman login | Tabel `sessions` tidak ada (SQL belum diimpor penuh). |
